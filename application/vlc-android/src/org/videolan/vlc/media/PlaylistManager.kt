@@ -178,6 +178,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     private var embeddedPoints: ABRepeat? = null
     private var gameLoopPoints: ABRepeat? = null
     private var embeddedLoopJob: Job? = null
+    private var abLoopJob: Job? = null
     val videoStatsOn by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Boolean>().apply { value = false } }
     val delayValue by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<DelayValues>().apply { value = DelayValues() } }
     val waitForConfirmation by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<WaitConfirmation?>().apply { value = null } }
@@ -514,6 +515,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     }
 
     fun setLoopMode(mode: LoopMode) {
+        abLoopJob?.cancel()
         loopMode = mode
         settings.putSingle(if (getCurrentMedia()?.type == MediaWrapper.TYPE_VIDEO) PLAYLIST_VIDEO_LOOP_MODE_KEY else PLAYLIST_AUDIO_LOOP_MODE_KEY, mode.ordinal)
         if (mode != LoopMode.NONE && repeating.value != PlaybackStateCompat.REPEAT_MODE_NONE) setRepeatType(PlaybackStateCompat.REPEAT_MODE_NONE)
@@ -545,6 +547,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         } else {
             setEmbeddedPoints(null)
             player.clearSampleLoop()
+            if (mode == LoopMode.AB) startABSampleLoop()
         }
         launch { determinePrevAndNextIndices() }
     }
@@ -584,7 +587,12 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         val isVideoPlaying = mw.type == MediaWrapper.TYPE_VIDEO && player.isVideoPlaying()
         setRepeatTypeFromSettings()
         clearABRepeat()
-        if (loopMode == LoopMode.AB && restoreAB != null) abRepeat.value = restoreAB
+        if (loopMode == LoopMode.AB) {
+            val savedStart = mw.getMetaLong(MediaWrapper.META_AB_REPEAT_START)
+            val savedStop = mw.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP)
+            abRepeat.value = restoreAB ?: if (settings.getBoolean(PLAYBACK_HISTORY, true) && savedStop > savedStart)
+                ABRepeat(savedStart, savedStop) else ABRepeat()
+        }
         abRepeatOn.value = loopMode == LoopMode.AB
         setEmbeddedPoints(null)
         if (!videoBackground && isVideoPlaying) mw.addFlags(MediaWrapper.MEDIA_VIDEO)
@@ -639,10 +647,15 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                     return
                 }
             }
-            if ((loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST) &&
+            if ((loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST || loopMode == LoopMode.AB) &&
                 mw.type == MediaWrapper.TYPE_AUDIO && !player.hasRenderer) {
                 if (!player.hasSampleLoopFor(mw.uri)) {
-                    val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, gameAudio?.uri ?: mw.uri) }
+                    val points = abRepeat.value
+                    val sampleLoop = if (loopMode == LoopMode.AB && points != null && points.stop > points.start && points.start >= 0)
+                        withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, gameAudio?.uri ?: mw.uri, points.start, points.stop) }
+                    else if (loopMode != LoopMode.AB)
+                        withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, gameAudio?.uri ?: mw.uri) }
+                    else null
                     player.setSampleLoop(mw.uri, sampleLoop)
                     if (loopStart == null && start > 0) player.seekSampleLoop(start)
                 }
@@ -857,6 +870,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
             val abStop = media.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP)
             abRepeat.value = ABRepeat(abStart, if (abStop > abStart) abStop else -1L)
             abRepeatOn.value = true
+            if (!player.hasSampleLoop()) startABSampleLoop()
         }
         if (player.canSwitchToVideo()) {
             val savedDelay = media.getMetaLong(MediaWrapper.META_AUDIODELAY)
@@ -1233,6 +1247,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
             media?.setLongMeta(MediaWrapper.META_AB_REPEAT_STOP, value.stop)
         }
         abRepeat.value = value
+        startABSampleLoop()
     }
 
     fun setDelayValue(time: Long, start: Boolean) {
@@ -1249,6 +1264,8 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         abRepeat.value = ABRepeat()
         media?.setLongMeta(MediaWrapper.META_AB_REPEAT_START, 0L)
         media?.setLongMeta(MediaWrapper.META_AB_REPEAT_STOP, 0L)
+        abLoopJob?.cancel()
+        if (loopMode == LoopMode.AB) player.clearSampleLoop()
     }
 
     fun toggleABRepeat() {
@@ -1264,11 +1281,38 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     }
 
     fun clearABRepeat() {
+        abLoopJob?.cancel()
         abRepeat.value = abRepeat.value?.apply {
             start = -1L
             stop = -1L
         }
         abRepeatOn.value = false
+    }
+
+    private fun startABSampleLoop() {
+        abLoopJob?.cancel()
+        if (loopMode != LoopMode.AB) return
+        val media = getCurrentMedia() ?: return
+        val points = abRepeat.value ?: return
+        val start = points.start
+        val stop = points.stop
+        if (media.type != MediaWrapper.TYPE_AUDIO || player.hasRenderer || start < 0 || stop <= start) {
+            player.clearSampleLoop()
+            return
+        }
+        val uri = media.uri
+        abLoopJob = launch {
+            val source = if (GameAudioConverter.supports(uri))
+                withContext(Dispatchers.IO) { GameAudioConverter.decode(ctx, uri)?.uri } else uri
+            val loop = source?.let { withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, it, start, stop) } }
+            if (loop != null && loopMode == LoopMode.AB && getCurrentMedia()?.uri == uri &&
+                abRepeat.value?.let { it.start == start && it.stop == stop } == true) {
+                val time = player.getCurrentTime()
+                player.setSampleLoop(uri, loop)
+                player.seekSampleLoop(time)
+                player.activateSampleLoop()
+            } else loop?.release()
+        }
     }
 
     private fun setEmbeddedPoints(points: ABRepeat?) {
@@ -1404,7 +1448,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 }
                 MediaPlayer.Event.TimeChanged -> {
                     val embedded = embeddedPoints
-                    if (embedded == null && (loopMode == LoopMode.AB || (loopMode == LoopMode.NONE && abRepeatOn.value == true))) abRepeat.value?.let {
+                    if (embedded == null && !player.hasSampleLoop() && (loopMode == LoopMode.AB || (loopMode == LoopMode.NONE && abRepeatOn.value == true))) abRepeat.value?.let {
                         val fastSeek = settings.getBoolean(KEY_ALWAYS_FAST_SEEK, false)
                         if (it.stop != -1L && player.getCurrentTime() > it.stop) service.setTime(it.start, false)
                         if ((fastSeek && player.getCurrentTime() < it.start - 30000L)

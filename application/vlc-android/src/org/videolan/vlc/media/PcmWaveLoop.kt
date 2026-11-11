@@ -13,7 +13,7 @@ import android.util.Log
 import java.io.InputStream
 import java.io.ByteArrayOutputStream
 
-/** A sample-accurate loop for local PCM WAVE and decoded Ogg Vorbis files. */
+/** A sample-accurate loop for local PCM WAVE and common Android-decoded audio files. */
 internal class PcmWaveLoop private constructor(
     private val track: AudioTrack,
     private val pcm: ByteArray,
@@ -62,7 +62,8 @@ internal class PcmWaveLoop private constructor(
 
     fun seekTo(timeMs: Long) {
         val resume = track.playState == AudioTrack.PLAYSTATE_PLAYING
-        val frame = (timeMs * sampleRate / 1000).coerceIn(0, (loopEnd - 1).toLong()).toInt()
+        val requested = (timeMs * sampleRate / 1000).coerceAtLeast(0)
+        val frame = if (requested >= loopEnd) loopStart else requested.toInt()
         synchronized(lock) {
             track.pause()
             track.flush()
@@ -99,18 +100,24 @@ internal class PcmWaveLoop private constructor(
         private const val MAX_PCM_BYTES = 64 * 1024 * 1024
 
         @Suppress("DEPRECATION")
-        fun load(context: Context, uri: Uri): PcmWaveLoop? {
+        fun load(context: Context, uri: Uri, abStartMs: Long? = null, abEndMs: Long? = null): PcmWaveLoop? {
             if (uri.scheme != "file" && uri.scheme != "content") return null
-            val isOgg = uri.lastPathSegment?.endsWith(".ogg", true) == true || uri.lastPathSegment?.endsWith(".oga", true) == true
+            val ab = abStartMs != null && abEndMs != null && abStartMs >= 0 && abEndMs > abStartMs
+            val extension = uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase()
             val wave = try {
-                if (isOgg) decodeVorbis(context, uri) else context.contentResolver.openInputStream(uri)?.use(::parse)
+                when (extension) {
+                    "wav", "wave" -> context.contentResolver.openInputStream(uri)?.use { parse(it, ab) }
+                    "ogg", "oga", "mp3", "m4a", "mp4", "aac", "flac" -> decodeAudio(context, uri, ab)
+                    else -> if (ab) decodeAudio(context, uri, true) else null
+                }
             } catch (error: Exception) {
                 Log.w("VELC/SampleLoop", "Cannot decode loop audio", error)
                 null
-            } ?: run {
-                if (isOgg) Log.w("VELC/SampleLoop", "Unsupported or unreadable Ogg Vorbis: $uri")
-                return null
-            }
+            } ?: return null
+            val frames = wave.pcm.size / (wave.channels * 2)
+            val start = if (ab) (abStartMs!! * wave.sampleRate / 1000).coerceIn(0, frames.toLong()).toInt() else wave.start
+            val end = if (ab) (abEndMs!! * wave.sampleRate / 1000).coerceIn(0, frames.toLong()).toInt() else wave.end
+            if (end <= start) return null
             val channelMask = if (wave.channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
             val track = try {
                 val minBuffer = AudioTrack.getMinBufferSize(wave.sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
@@ -126,26 +133,26 @@ internal class PcmWaveLoop private constructor(
                 track.release()
                 return null
             }
-            Log.i("VELC/SampleLoop", "Loaded ${wave.pcm.size / (wave.channels * 2)} frames; loop ${wave.start}..${wave.end}")
+            Log.i("VELC/SampleLoop", "Loaded $frames frames; loop $start..$end")
             return PcmWaveLoop(track, wave.pcm, wave.sampleRate,
-                wave.pcm.size / (wave.channels * 2), wave.start, wave.end, wave.channels * 2)
+                frames, start, end, wave.channels * 2)
         }
 
         private data class Wave(val sampleRate: Int, val channels: Int, val start: Int, val end: Int, val pcm: ByteArray)
 
-        private fun decodeVorbis(context: Context, uri: Uri): Wave? {
+        private fun decodeAudio(context: Context, uri: Uri, ab: Boolean): Wave? {
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
             try {
                 extractor.setDataSource(context, uri, null)
                 val trackIndex = (0 until extractor.trackCount).firstOrNull {
-                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) == "audio/vorbis"
+                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
                 } ?: return null
                 extractor.selectTrack(trackIndex)
                 val format = extractor.getTrackFormat(trackIndex)
                 val rateFromFile = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                if (EmbeddedLoopPoints.readSampleFrames(context, uri, rateFromFile, Int.MAX_VALUE) == null) return null
-                val decoder = MediaCodec.createDecoderByType("audio/vorbis")
+                if (!ab && EmbeddedLoopPoints.readSampleFrames(context, uri, rateFromFile, Int.MAX_VALUE) == null) return null
+                val decoder = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME) ?: return null)
                 codec = decoder
                 decoder.configure(format, null, null, 0)
                 decoder.start()
@@ -178,7 +185,7 @@ internal class PcmWaveLoop private constructor(
                     when {
                         index >= 0 -> {
                             if (info.size > 0) {
-                                require(pcm.size() + info.size <= MAX_PCM_BYTES) { "Ogg PCM exceeds loop buffer" }
+                                require(pcm.size() + info.size <= MAX_PCM_BYTES) { "Decoded PCM exceeds loop buffer" }
                                 val buffer = decoder.getOutputBuffer(index) ?: return null
                                 buffer.position(info.offset)
                                 buffer.limit(info.offset + info.size)
@@ -205,7 +212,7 @@ internal class PcmWaveLoop private constructor(
                 val data = pcm.toByteArray()
                 if (data.isEmpty() || data.size % (channels * 2) != 0) return null
                 val frames = data.size / (channels * 2)
-                val (start, end) = EmbeddedLoopPoints.readSampleFrames(context, uri, rate, frames) ?: return null
+                val (start, end) = if (ab) 0 to frames else EmbeddedLoopPoints.readSampleFrames(context, uri, rate, frames) ?: return null
                 return Wave(rate, channels, start, end, data)
             } finally {
                 try { codec?.stop() } catch (_: Exception) { }
@@ -214,7 +221,7 @@ internal class PcmWaveLoop private constructor(
             }
         }
 
-        private fun parse(input: InputStream): Wave? {
+        private fun parse(input: InputStream, ab: Boolean): Wave? {
             val riff = ByteArray(12)
             if (!input.readAll(riff) || riff.label(0) != "RIFF" || riff.label(8) != "WAVE") return null
             var rate = 0
@@ -237,13 +244,17 @@ internal class PcmWaveLoop private constructor(
                         if (channels !in 1..2 || rate !in 8000..192000 || !input.skipAll(size - 16)) return null
                     }
                     "smpl" -> {
-                        if (size < 60) return null
-                        val sample = ByteArray(60)
-                        if (!input.readAll(sample)) return null
-                        if (sample.uint(28) < 1 || sample.uint(40) != 0L) return null
-                        start = sample.uint(44).toInt()
-                        end = (sample.uint(48) + 1).toInt()
-                        if (!input.skipAll(size - 60)) return null
+                        if (ab) {
+                            if (!input.skipAll(size)) return null
+                        } else {
+                            if (size < 60) return null
+                            val sample = ByteArray(60)
+                            if (!input.readAll(sample)) return null
+                            if (sample.uint(28) < 1 || sample.uint(40) != 0L) return null
+                            start = sample.uint(44).toInt()
+                            end = (sample.uint(48) + 1).toInt()
+                            if (!input.skipAll(size - 60)) return null
+                        }
                     }
                     "data" -> {
                         if (size <= 0 || size > MAX_PCM_BYTES.toLong()) return null
@@ -254,8 +265,8 @@ internal class PcmWaveLoop private constructor(
                 }
                 if (size and 1L != 0L && !input.skipAll(1)) return null
                 val data = pcm
-                if (rate > 0 && start >= 0 && end > start && data != null && end <= data.size / (channels * 2))
-                    return Wave(rate, channels, start, end, data)
+                if (rate > 0 && data != null && (ab || (start >= 0 && end > start && end <= data.size / (channels * 2))))
+                    return Wave(rate, channels, if (ab) 0 else start, if (ab) data.size / (channels * 2) else end, data)
             }
             return null
         }
