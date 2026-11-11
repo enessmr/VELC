@@ -4,12 +4,16 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.util.Log
 import java.io.InputStream
+import java.io.ByteArrayOutputStream
 
-/** A sample-accurate loop for local, 16-bit PCM WAVE files with a `smpl` chunk. */
+/** A sample-accurate loop for local PCM WAVE and decoded Ogg Vorbis files. */
 internal class PcmWaveLoop private constructor(
     private val track: AudioTrack,
     private val pcm: ByteArray,
@@ -97,11 +101,14 @@ internal class PcmWaveLoop private constructor(
         @Suppress("DEPRECATION")
         fun load(context: Context, uri: Uri): PcmWaveLoop? {
             if (uri.scheme != "file" && uri.scheme != "content") return null
-            val wave = try { context.contentResolver.openInputStream(uri)?.use(::parse) } catch (error: Exception) {
-                Log.w("VELC/SampleLoop", "Cannot read PCM WAVE", error)
+            val isOgg = uri.lastPathSegment?.endsWith(".ogg", true) == true || uri.lastPathSegment?.endsWith(".oga", true) == true
+            val wave = try {
+                if (isOgg) decodeVorbis(context, uri) else context.contentResolver.openInputStream(uri)?.use(::parse)
+            } catch (error: Exception) {
+                Log.w("VELC/SampleLoop", "Cannot decode loop audio", error)
                 null
             } ?: run {
-                Log.w("VELC/SampleLoop", "Unsupported or unreadable PCM WAVE: $uri")
+                if (isOgg) Log.w("VELC/SampleLoop", "Unsupported or unreadable Ogg Vorbis: $uri")
                 return null
             }
             val channelMask = if (wave.channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
@@ -125,6 +132,87 @@ internal class PcmWaveLoop private constructor(
         }
 
         private data class Wave(val sampleRate: Int, val channels: Int, val start: Int, val end: Int, val pcm: ByteArray)
+
+        private fun decodeVorbis(context: Context, uri: Uri): Wave? {
+            val extractor = MediaExtractor()
+            var codec: MediaCodec? = null
+            try {
+                extractor.setDataSource(context, uri, null)
+                val trackIndex = (0 until extractor.trackCount).firstOrNull {
+                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) == "audio/vorbis"
+                } ?: return null
+                extractor.selectTrack(trackIndex)
+                val format = extractor.getTrackFormat(trackIndex)
+                val rateFromFile = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                if (EmbeddedLoopPoints.readSampleFrames(context, uri, rateFromFile, Int.MAX_VALUE) == null) return null
+                val decoder = MediaCodec.createDecoderByType("audio/vorbis")
+                codec = decoder
+                decoder.configure(format, null, null, 0)
+                decoder.start()
+                val pcm = ByteArrayOutputStream()
+                val info = MediaCodec.BufferInfo()
+                var inputDone = false
+                var outputDone = false
+                var idle = 0
+                var rate = rateFromFile
+                var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                while (!outputDone && idle < 1000) {
+                    var progressed = false
+                    if (!inputDone) {
+                        val index = decoder.dequeueInputBuffer(10_000)
+                        if (index >= 0) {
+                            val buffer = decoder.getInputBuffer(index) ?: return null
+                            buffer.clear()
+                            val size = extractor.readSampleData(buffer, 0)
+                            if (size < 0) {
+                                decoder.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inputDone = true
+                            } else {
+                                decoder.queueInputBuffer(index, 0, size, extractor.sampleTime, extractor.sampleFlags)
+                                extractor.advance()
+                            }
+                            progressed = true
+                        }
+                    }
+                    val index = decoder.dequeueOutputBuffer(info, 10_000)
+                    when {
+                        index >= 0 -> {
+                            if (info.size > 0) {
+                                require(pcm.size() + info.size <= MAX_PCM_BYTES) { "Ogg PCM exceeds loop buffer" }
+                                val buffer = decoder.getOutputBuffer(index) ?: return null
+                                buffer.position(info.offset)
+                                buffer.limit(info.offset + info.size)
+                                val bytes = ByteArray(info.size)
+                                buffer.get(bytes)
+                                pcm.write(bytes)
+                            }
+                            outputDone = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                            decoder.releaseOutputBuffer(index, false)
+                            progressed = true
+                        }
+                        index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val output = decoder.outputFormat
+                            rate = output.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            channels = output.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            if (output.containsKey(MediaFormat.KEY_PCM_ENCODING) &&
+                                output.getInteger(MediaFormat.KEY_PCM_ENCODING) != AudioFormat.ENCODING_PCM_16BIT) return null
+                            progressed = true
+                        }
+                    }
+                    idle = if (progressed) 0 else idle + 1
+                }
+                if (!outputDone || rate !in 8000..192000 || channels !in 1..2) return null
+                val data = pcm.toByteArray()
+                if (data.isEmpty() || data.size % (channels * 2) != 0) return null
+                val frames = data.size / (channels * 2)
+                val (start, end) = EmbeddedLoopPoints.readSampleFrames(context, uri, rate, frames) ?: return null
+                return Wave(rate, channels, start, end, data)
+            } finally {
+                try { codec?.stop() } catch (_: Exception) { }
+                codec?.release()
+                extractor.release()
+            }
+        }
 
         private fun parse(input: InputStream): Wave? {
             val riff = ByteArray(12)

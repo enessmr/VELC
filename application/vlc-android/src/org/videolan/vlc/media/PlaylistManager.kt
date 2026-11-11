@@ -1355,6 +1355,9 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                     playingState.value = true
                 }
                 MediaPlayer.Event.EndReached -> {
+                    // The independent PCM player already loops sample-accurately. The muted
+                    // libVLC decoder reaching EOF must not restart and interrupt it.
+                    if (player.hasSampleLoop() && stopAfter != currentIndex) return
                     if (stopAfter != currentIndex && (loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.AB || (loopMode == LoopMode.EMBEDDED_PLAYLIST && embeddedPoints != null))) {
                         val points = if (loopMode == LoopMode.AB) abRepeat.value?.let { ABRepeat(it.start, it.stop) } else null
                         val embeddedStart = if (loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST) embeddedPoints?.start else null

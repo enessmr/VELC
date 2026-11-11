@@ -12,6 +12,43 @@ internal object EmbeddedLoopPoints {
     private val tag = Regex("(?i)(?:^|[^A-Z])(?:LOOPSTART|LOOP_START|LOOPEND|LOOP_END|LOOPLENGTH|LOOP_LENGTH)[\\s=:]+[0-9:.]+(?:ms|s)?")
     private val value = Regex("(?i)(LOOPSTART|LOOP_START|LOOPEND|LOOP_END|LOOPLENGTH|LOOP_LENGTH)[\\s=:]+([0-9:.]+)(ms|s)?")
 
+    /** Preserve sample precision for decoded Ogg Vorbis loops. */
+    fun readSampleFrames(context: Context, uri: Uri, sampleRate: Int, frameCount: Int): Pair<Int, Int>? {
+        if (sampleRate <= 0 || frameCount <= 0) return null
+        val bytes = try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                while (output.size() < MAX_HEADER) {
+                    val count = input.read(buffer, 0, minOf(buffer.size, MAX_HEADER - output.size()))
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                }
+                output.toByteArray()
+            } ?: return null
+        } catch (_: Exception) { return null }
+        if (bytes.size < 4 || !bytes.copyOfRange(0, 4).contentEquals("OggS".toByteArray())) return null
+        val tags = mutableMapOf<String, Pair<String, String?>>()
+        for (match in tag.findAll(bytes.toString(Charsets.ISO_8859_1).replace('\u0000', '='))) {
+            val parsed = value.find(match.value) ?: continue
+            tags[parsed.groupValues[1].replace("_", "").uppercase()] = parsed.groupValues[2] to parsed.groupValues[3].lowercase().ifEmpty { null }
+        }
+        fun frames(entry: Pair<String, String?>?): Long? {
+            if (entry == null) return null
+            val (raw, unit) = entry
+            return when {
+                unit == "ms" -> raw.toDoubleOrNull()?.let { (it * sampleRate / 1000).toLong() }
+                unit == "s" || raw.contains(':') || raw.contains('.') ->
+                    raw.split(':').fold(0.0) { acc, part -> acc * 60 + (part.toDoubleOrNull() ?: return null) }
+                        .let { (it * sampleRate).toLong() }
+                else -> raw.toLongOrNull()
+            }
+        }
+        val start = frames(tags["LOOPSTART"]) ?: return null
+        val end = frames(tags["LOOPEND"]) ?: frames(tags["LOOPLENGTH"])?.let { start + it } ?: frameCount.toLong()
+        return if (start >= 0 && end > start && end <= frameCount) start.toInt() to end.toInt() else null
+    }
+
     fun read(context: Context, uri: Uri, duration: Long): ABRepeat? {
         if (uri.scheme != "file" && uri.scheme != "content") return null
         try {
