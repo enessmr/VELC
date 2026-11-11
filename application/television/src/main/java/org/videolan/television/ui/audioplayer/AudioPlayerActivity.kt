@@ -429,6 +429,7 @@ class AudioPlayerActivity : BaseTvActivity(),KeycodeListener, PlaybackService.Ca
     }
 
     private fun switchRepeatMode() {
+        model.service?.playlistManager?.setLoopMode(org.videolan.vlc.media.LoopMode.NONE)
         when (model.repeatType) {
             PlaybackStateCompat.REPEAT_MODE_NONE -> {
                 model.repeatType = PlaybackStateCompat.REPEAT_MODE_ALL

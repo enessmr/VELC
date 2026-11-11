@@ -794,6 +794,7 @@ class AudioPlayer : Fragment(), PlaylistAdapter.IPlayer, TextWatcher, IAudioPlay
     }
 
     fun onRepeatClick(@Suppress("UNUSED_PARAMETER") view: View) {
+        playlistModel.service?.playlistManager?.setLoopMode(org.videolan.vlc.media.LoopMode.NONE)
         playlistModel.repeatType = when (playlistModel.repeatType) {
             PlaybackStateCompat.REPEAT_MODE_NONE -> PlaybackStateCompat.REPEAT_MODE_ALL
             PlaybackStateCompat.REPEAT_MODE_ALL -> PlaybackStateCompat.REPEAT_MODE_ONE

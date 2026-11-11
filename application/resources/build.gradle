@@ -25,7 +25,7 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {
-            buildConfigField "String", "APP_ID", "\"${rootProject.ext.appId}.debug\""
+            buildConfigField "String", "APP_ID", "\"${rootProject.ext.appId}\""
         }
         dev {
             initWith debug

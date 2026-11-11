@@ -5,7 +5,7 @@
     <!-- Main VLC Interface -->
     <string name="ok">OK</string>
     <string name="cancel">Cancel</string>
-    <string name="app_name" translatable="false">VLC</string>
+    <string name="app_name" translatable="false">VELC</string>
     <string name="other">Other</string>
     <string name="sortby">Sort by…</string>
     <string name="sortby_name">Name</string>
@@ -323,7 +323,7 @@
     <string name="hold_to_stop">Hold to stop</string>
 
     <!-- About -->
-    <string name="app_name_full">VLC for Android</string>
+    <string name="app_name_full">VELC</string>
     <string name="revision">Revision</string>
     <string name="about">About</string>
     <string name="about_vlc_text">VLC for Android™ is a port of VLC media player, the popular open source media player. The Android™ version can read all files and network streams.</string>
@@ -859,6 +859,9 @@
     <string name="otg_device_title">OTG device</string>
     <string name="browser">Browser</string>
     <string name="ab_repeat">A-B repeat</string>
+    <string name="ab_loop_mode">A-B Loop</string>
+    <string name="embedded_loop_playlist">Embedded Loop Playlist</string>
+    <string name="embedded_loop_single">Embedded Loop</string>
     <string name="ab_repeat_reset">Reset A-B repeat</string>
     <string name="ab_repeat_stop">Stop A-B repeat</string>
     <string name="stop_after_this">Stop after this track</string>

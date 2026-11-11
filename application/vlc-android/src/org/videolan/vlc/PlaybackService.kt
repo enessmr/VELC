@@ -1255,6 +1255,8 @@ class PlaybackService : MediaBrowserServiceCompat(), LifecycleOwner, CoroutineSc
         if (this@PlaybackService::mediaSession.isInitialized) mediaSession.setMetadata(bob)
     }
 
+    internal fun publishSampleLoopPosition(position: Long) = publishState(position)
+
     private fun publishState(position: Long? = null) {
         if (!this::mediaSession.isInitialized) return
         if (AndroidDevices.isAndroidTv) scheduler.cancelAction(END_MEDIASESSION)

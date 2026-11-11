@@ -75,8 +75,8 @@ android {
         debug {
             buildConfigField "boolean", "BETA", "false"
             resValue 'string', 'benchmark_package_name', 'org.videolan.vlcbenchmark.debug'
-            buildConfigField "String", "APP_ID", "\"${rootProject.ext.appId}.debug\""
-            resValue 'string', 'tv_provider_authority', "${rootProject.ext.appId}.debug.tv"
+            buildConfigField "String", "APP_ID", "\"${rootProject.ext.appId}\""
+            resValue 'string', 'tv_provider_authority', "${rootProject.ext.appId}.tv"
             buildConfigField "boolean", "NO_TV", "false"
             multiDexEnabled = true
         }

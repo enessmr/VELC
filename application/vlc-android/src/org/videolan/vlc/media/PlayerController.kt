@@ -3,6 +3,7 @@ package org.videolan.vlc.media
 import android.content.Context
 import android.net.Uri
 import android.support.v4.media.session.PlaybackStateCompat
+import android.util.Log
 import android.widget.Toast
 import androidx.annotation.MainThread
 import androidx.core.net.toUri
@@ -37,6 +38,12 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
     val progress by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Progress>().apply { value = Progress() } }
     val speed by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Float>().apply { value = 1.0F } }
     private val slaveRepository by lazy { SlaveRepository.getInstance(context) }
+    private var sampleLoop: PcmWaveLoop? = null
+    private var sampleLoopUri: Uri? = null
+    private var sampleLoopVolume = 100
+    private var logicalVolume = 100
+    private var sampleLoopProgressJob: Job? = null
+    var onSampleLoopWrap: ((Long) -> Unit)? = null
 
     var mediaplayer = newMediaPlayer()
         private set
@@ -56,17 +63,20 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
 
     fun play() {
         if (mediaplayer.hasMedia() && !mediaplayer.isReleased) mediaplayer.play()
+        sampleLoop?.play()
     }
 
     fun pause(): Boolean {
         if (isPlaying() && mediaplayer.hasMedia() && pausable) {
             mediaplayer.pause()
+            sampleLoop?.pause()
             return true
         }
         return false
     }
 
     fun stop() {
+        clearSampleLoop()
         if (mediaplayer.hasMedia() && !mediaplayer.isReleased) mediaplayer.stop()
         setPlaybackStopped()
     }
@@ -77,6 +87,46 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
     }
 
     private var mediaplayerEventListener: MediaPlayerEventListener? = null
+    fun hasSampleLoopFor(uri: Uri) = sampleLoop != null && sampleLoopUri == uri
+
+    internal fun setSampleLoop(uri: Uri, loop: PcmWaveLoop?) {
+        clearSampleLoop()
+        sampleLoop = loop
+        sampleLoopUri = if (loop != null) uri else null
+        sampleLoopVolume = logicalVolume
+        loop?.setVolume(sampleLoopVolume)
+        if (loop != null) sampleLoopProgressJob = launch {
+            while (sampleLoop === loop) {
+                if (isPlaying()) {
+                    val time = loop.positionMs()
+                    if (lastTime - time > 1_000L) onSampleLoopWrap?.invoke(time)
+                    updateProgress(time, loop.durationMs)
+                    lastTime = time
+                }
+                delay(50L)
+            }
+        }
+    }
+
+    fun clearSampleLoop() {
+        sampleLoopProgressJob?.cancel()
+        sampleLoopProgressJob = null
+        if (sampleLoop != null && !mediaplayer.isReleased) mediaplayer.volume = logicalVolume
+        sampleLoop?.release()
+        sampleLoop = null
+        sampleLoopUri = null
+    }
+
+    fun hasSampleLoop() = sampleLoop != null
+
+    fun seekSampleLoop(time: Long) = sampleLoop?.seekTo(time)
+
+    fun activateSampleLoop() {
+        if (sampleLoop == null || mediaplayer.isReleased) return
+        mediaplayer.volume = 0
+        if (isPlaying()) sampleLoop?.play()
+    }
+
     internal suspend fun startPlayback(media: IMedia, listener: MediaPlayerEventListener, time: Long) {
         mediaplayerEventListener = listener
         resetPlaybackState(time, media.duration)
@@ -84,6 +134,7 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
         withContext(Dispatchers.IO) { if (!mediaplayer.isReleased) mediaplayer.media = media.apply { if (hasRenderer) parse() } }
         mediaplayer.setEventListener(this@PlayerController)
         if (!mediaplayer.isReleased) {
+            if (sampleLoop != null) mediaplayer.volume = 0
             if (Settings.getInstance(context).getBoolean(KEY_EQUALIZER_ENABLED, false)) withContext(Dispatchers.IO) {
                 val repository = EqualizerRepository.getInstance(context)
                 mediaplayer.setEqualizer(repository.getCurrentEqualizer(context).getEqualizer())
@@ -104,6 +155,7 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
 
     @MainThread
     fun restart() {
+        clearSampleLoop()
         val mp = mediaplayer
         val volume:Int? = if (!mp.isReleased) mp.volume else null
         mediaplayer = newMediaPlayer()
@@ -117,10 +169,12 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
 
     fun setPosition(position: Float) {
         if (seekable && mediaplayer.hasMedia() && !mediaplayer.isReleased) mediaplayer.position = position
+        sampleLoop?.seekTo((position * getLength()).toLong())
     }
 
     fun setTime(time: Long, fast:Boolean = false) {
         if (seekable && mediaplayer.hasMedia() && !mediaplayer.isReleased) mediaplayer.setTime(time, fast)
+        sampleLoop?.seekTo(time)
     }
 
     fun isPlaying() = playbackState == PlaybackStateCompat.STATE_PLAYING
@@ -201,6 +255,7 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
     }
 
     fun release(player: MediaPlayer = mediaplayer) {
+        clearSampleLoop()
         player.setEventListener(null)
         if (isVideoPlaying()) player.vlcVout.detachViews()
         releaseMedia()
@@ -242,13 +297,14 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
         switchToVideo = false
     }
 
-    fun getCurrentTime() = progress.value?.time ?: 0L
+    fun getCurrentTime() = sampleLoop?.positionMs() ?: (progress.value?.time ?: 0L)
 
-    fun getLength() = progress.value?.length ?: 0L
+    fun getLength() = sampleLoop?.durationMs ?: (progress.value?.length ?: 0L)
 
     fun setRate(rate: Float, save: Boolean) {
         if (mediaplayer.isReleased) return
         mediaplayer.rate = rate
+        sampleLoop?.setRate(rate)
         speed.postValue(rate)
     }
 
@@ -301,9 +357,18 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
         if (!mediaplayer.isReleased)  mediaplayer.title = title
     }
 
-    fun getVolume() = if (!mediaplayer.isReleased) mediaplayer.volume else 100
+    fun getVolume() = if (sampleLoop != null) sampleLoopVolume else if (!mediaplayer.isReleased) mediaplayer.volume else 100
 
-    fun setVolume(volume: Int) = if (!mediaplayer.isReleased) mediaplayer.setVolume(volume) else -1
+    fun setVolume(volume: Int): Int {
+        logicalVolume = volume
+        sampleLoop?.let {
+            Log.i("VELC/SampleLoop", "Sample output volume $volume")
+            sampleLoopVolume = volume
+            it.setVolume(volume)
+            return 0
+        }
+        return if (!mediaplayer.isReleased) mediaplayer.setVolume(volume) else -1
+    }
 
     suspend fun expand(): IMediaList? {
         return mediaplayer.media?.let {
@@ -323,14 +388,20 @@ class PlayerController(val context: Context) : IVLCVout.Callback, MediaPlayer.Ev
     private val eventActor = actor<MediaPlayer.Event>(capacity = Channel.UNLIMITED, start = CoroutineStart.UNDISPATCHED) {
         for (event in channel) {
             when (event.type) {
-                MediaPlayer.Event.Playing -> playbackState = PlaybackStateCompat.STATE_PLAYING
-                MediaPlayer.Event.Paused -> playbackState = PlaybackStateCompat.STATE_PAUSED
+                MediaPlayer.Event.Playing -> {
+                    playbackState = PlaybackStateCompat.STATE_PLAYING
+                    sampleLoop?.play()
+                }
+                MediaPlayer.Event.Paused -> {
+                    playbackState = PlaybackStateCompat.STATE_PAUSED
+                    sampleLoop?.pause()
+                }
                 MediaPlayer.Event.EncounteredError -> setPlaybackStopped()
                 MediaPlayer.Event.PausableChanged -> pausable = event.pausable
                 MediaPlayer.Event.SeekableChanged -> seekable = event.seekable
                 MediaPlayer.Event.LengthChanged -> updateProgress(newLength = event.lengthChanged)
                 MediaPlayer.Event.TimeChanged -> {
-                    val time = event.timeChanged
+                    val time = sampleLoop?.positionMs() ?: event.timeChanged
                     if ((time - lastTime).absoluteValue > 950L) {
                         updateProgress(newTime = time)
                         lastTime = time

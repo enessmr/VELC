@@ -31,6 +31,19 @@ application/remote-access-client/assets/**
 # Local configuration
 local.properties
 env.sh
+.env
+.env.*
+!.env.example
+*.local.properties
+credentials.properties
+secrets.properties
+signing.properties
+keystore.properties
+google-services.json
+service-account*.json
+firebase-adminsdk*.json
+.netrc
+.npmrc
 
 # OS specific
 .DS_Store
@@ -41,6 +54,11 @@ Thumbs.db
 
 # Signage keys
 *.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
 
 # Eclipse
 #.classpath

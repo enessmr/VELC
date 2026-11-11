@@ -260,11 +260,14 @@ internal class MediaSessionCallback(private val playbackService: PlaybackService
             CUSTOM_ACTION_REWIND -> onRewind()
             CUSTOM_ACTION_FAST_FORWARD -> onFastForward()
             CUSTOM_ACTION_SHUFFLE -> if (playbackService.canShuffle()) playbackService.shuffle()
-            CUSTOM_ACTION_REPEAT -> playbackService.repeatType = when (playbackService.repeatType) {
-                PlaybackStateCompat.REPEAT_MODE_NONE -> PlaybackStateCompat.REPEAT_MODE_ALL
-                PlaybackStateCompat.REPEAT_MODE_ALL -> PlaybackStateCompat.REPEAT_MODE_ONE
-                PlaybackStateCompat.REPEAT_MODE_ONE -> PlaybackStateCompat.REPEAT_MODE_NONE
-                else -> PlaybackStateCompat.REPEAT_MODE_NONE
+            CUSTOM_ACTION_REPEAT -> {
+                playbackService.playlistManager.setLoopMode(org.videolan.vlc.media.LoopMode.NONE)
+                playbackService.repeatType = when (playbackService.repeatType) {
+                    PlaybackStateCompat.REPEAT_MODE_NONE -> PlaybackStateCompat.REPEAT_MODE_ALL
+                    PlaybackStateCompat.REPEAT_MODE_ALL -> PlaybackStateCompat.REPEAT_MODE_ONE
+                    PlaybackStateCompat.REPEAT_MODE_ONE -> PlaybackStateCompat.REPEAT_MODE_NONE
+                    else -> PlaybackStateCompat.REPEAT_MODE_NONE
+                }
             }
         }
     }
@@ -442,6 +445,7 @@ internal class MediaSessionCallback(private val playbackService: PlaybackService
     }
 
     override fun onSetRepeatMode(repeatMode: Int) {
+        playbackService.playlistManager.setLoopMode(org.videolan.vlc.media.LoopMode.NONE)
         playbackService.repeatType = repeatMode
     }
 

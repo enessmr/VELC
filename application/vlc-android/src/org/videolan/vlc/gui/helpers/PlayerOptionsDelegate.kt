@@ -48,6 +48,7 @@ import org.videolan.vlc.gui.helpers.hf.PinCodeDelegate
 import org.videolan.vlc.gui.helpers.hf.checkPIN
 import org.videolan.vlc.gui.video.VideoPlayerActivity
 import org.videolan.vlc.media.PlayerController
+import org.videolan.vlc.media.LoopMode
 import org.videolan.vlc.util.TextUtils
 import org.videolan.vlc.util.getScreenHeight
 import org.videolan.vlc.util.isTalkbackIsEnabled
@@ -80,6 +81,9 @@ private const val ID_AUDIO_CONTROL_SETTING = 20L
 private const val ID_SAFE_MODE_LOCK = 21L
 private const val ID_SAFE_MODE_UNLOCK = 22L
 private const val ID_SHARE = 23L
+private const val ID_AB_LOOP = 24L
+private const val ID_EMBEDDED_PLAYLIST = 25L
+private const val ID_EMBEDDED_SINGLE = 26L
 @SuppressLint("ShowToast")
 class PlayerOptionsDelegate(val activity: FragmentActivity, val service: PlaybackService, private val showABReapeat:Boolean = true)  {
 
@@ -124,6 +128,9 @@ class PlayerOptionsDelegate(val activity: FragmentActivity, val service: Playbac
         if (chaptersCount > 1) options.add(PlayerOption(ID_CHAPTER_TITLE, R.drawable.ic_chapter, res.getString(R.string.go_to_chapter)))
         if (::bookmarkClickedListener.isInitialized) options.add(PlayerOption(ID_BOOKMARK, R.drawable.ic_bookmark, res.getString(R.string.bookmarks)))
         if (showABReapeat) options.add(PlayerOption(ID_ABREPEAT, R.drawable.ic_abrepeat, res.getString(R.string.ab_repeat)))
+        if (showABReapeat) options.add(PlayerOption(ID_AB_LOOP, R.drawable.ic_abrepeat, loopTitle(LoopMode.AB, R.string.ab_loop_mode)))
+        if (service.hasPlaylist()) options.add(PlayerOption(ID_EMBEDDED_PLAYLIST, R.drawable.ic_repeat_all, loopTitle(LoopMode.EMBEDDED_PLAYLIST, R.string.embedded_loop_playlist)))
+        options.add(PlayerOption(ID_EMBEDDED_SINGLE, R.drawable.ic_repeat_one, loopTitle(LoopMode.EMBEDDED_SINGLE, R.string.embedded_loop_single)))
         options.add(PlayerOption(ID_SAVE_PLAYLIST, R.drawable.ic_addtoplaylist, res.getString(R.string.playlist_save)))
         if (service.playlistManager.player.canDoPassthrough() && settings.getString(KEY_AOUT, "0") != "2")
             options.add(PlayerOption(ID_PASSTHROUGH, R.drawable.ic_passthrough, res.getString(R.string.audio_digital_title)))
@@ -220,6 +227,9 @@ class PlayerOptionsDelegate(val activity: FragmentActivity, val service: Playbac
                 hide()
             }
             ID_REPEAT -> setRepeatMode()
+            ID_AB_LOOP -> selectLoopMode(LoopMode.AB)
+            ID_EMBEDDED_PLAYLIST -> selectLoopMode(LoopMode.EMBEDDED_PLAYLIST)
+            ID_EMBEDDED_SINGLE -> selectLoopMode(LoopMode.EMBEDDED_SINGLE)
             ID_SHUFFLE -> {
                 service.shuffle()
                 setShuffle()
@@ -344,6 +354,7 @@ class PlayerOptionsDelegate(val activity: FragmentActivity, val service: Playbac
     }
 
     private fun setRepeatMode() {
+        service.playlistManager.setLoopMode(LoopMode.NONE)
         when (service.repeatType) {
             PlaybackStateCompat.REPEAT_MODE_NONE -> {
                 repeatBinding.optionIcon.setImageResource(R.drawable.ic_repeat_one)
@@ -365,6 +376,14 @@ class PlayerOptionsDelegate(val activity: FragmentActivity, val service: Playbac
                 repeatBinding.root.contentDescription = repeatBinding.root.context.getString(R.string.repeat_none)
             }
         }
+    }
+
+    private fun loopTitle(mode: LoopMode, title: Int): String =
+        res.getString(title) + if (service.playlistManager.loopMode == mode) " ✓" else ""
+
+    private fun selectLoopMode(mode: LoopMode) {
+        service.playlistManager.setLoopMode(if (service.playlistManager.loopMode == mode) LoopMode.NONE else mode)
+        setup()
     }
 
     private fun setShuffle() {

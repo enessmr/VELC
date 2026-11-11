@@ -12,9 +12,11 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.ObsoleteCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.actor
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -107,6 +109,11 @@ private const val TAG = "VLC/PlaylistManager"
 private const val PREVIOUS_LIMIT_DELAY = 5000L
 private const val PLAYLIST_AUDIO_REPEAT_MODE_KEY = "audio_repeat_mode"
 private const val PLAYLIST_VIDEO_REPEAT_MODE_KEY = "video_repeat_mode"
+private const val PLAYLIST_AUDIO_LOOP_MODE_KEY = "audio_loop_mode"
+private const val PLAYLIST_VIDEO_LOOP_MODE_KEY = "video_loop_mode"
+private const val EMBEDDED_LOOP_SEEK_LEAD_MS = 100L
+
+enum class LoopMode { NONE, AB, EMBEDDED_PLAYLIST, EMBEDDED_SINGLE }
 
 class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventListener, IMedia.EventListener, CoroutineScope {
     private var endReachedFor: String? = null
@@ -128,7 +135,11 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     }
 
     private val medialibrary by lazy(LazyThreadSafetyMode.NONE) { Medialibrary.getInstance() }
-    val player by lazy(LazyThreadSafetyMode.NONE) { PlayerController(service.applicationContext) }
+    val player by lazy(LazyThreadSafetyMode.NONE) {
+        PlayerController(service.applicationContext).apply {
+            onSampleLoopWrap = service::publishSampleLoopPosition
+        }
+    }
     private val settings by lazy(LazyThreadSafetyMode.NONE) { Settings.getInstance(service) }
     private val ctx by lazy(LazyThreadSafetyMode.NONE) { service.applicationContext }
     var currentIndex = -1
@@ -162,6 +173,10 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     private var entryUrl : String? = null
     val abRepeat by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<ABRepeat>().apply { value = ABRepeat() } }
     val abRepeatOn by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Boolean>().apply { value = false } }
+    var loopMode = LoopMode.NONE
+        private set
+    private var embeddedPoints: ABRepeat? = null
+    private var embeddedLoopJob: Job? = null
     val videoStatsOn by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Boolean>().apply { value = false } }
     val delayValue by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<DelayValues>().apply { value = DelayValues() } }
     val waitForConfirmation by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<WaitConfirmation?>().apply { value = null } }
@@ -390,6 +405,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     }
 
     fun stop(systemExit: Boolean = false, video: Boolean = false) {
+        setEmbeddedPoints(null)
         clearABRepeat()
         if (stopAfter != -1) Settings.getInstance(AppContextProvider.appContext).putSingle(AUDIO_STOP_AFTER, stopAfter)
         stopAfter = -1
@@ -456,8 +472,11 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
      * Will set the repeating variable from the value that has been saved in settings
      */
     private fun setRepeatTypeFromSettings() {
+        val video = getCurrentMedia()?.type == MediaWrapper.TYPE_VIDEO
+        loopMode = LoopMode.values().getOrNull(settings.getInt(if (video) PLAYLIST_VIDEO_LOOP_MODE_KEY else PLAYLIST_AUDIO_LOOP_MODE_KEY, 0)) ?: LoopMode.NONE
+        if (loopMode == LoopMode.EMBEDDED_PLAYLIST && !hasPlaylist()) loopMode = LoopMode.NONE
         AppScope.launch {
-            repeating.emit(if (getCurrentMedia()?.type == MediaWrapper.TYPE_VIDEO) {
+            repeating.emit(if (video) {
                 settings.getInt(PLAYLIST_VIDEO_REPEAT_MODE_KEY, PlaybackStateCompat.REPEAT_MODE_NONE)
             } else
                 settings.getInt(PLAYLIST_AUDIO_REPEAT_MODE_KEY, PlaybackStateCompat.REPEAT_MODE_NONE)
@@ -469,10 +488,43 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     fun setRepeatType(repeatType: Int) {
         AppScope.launch { repeating.emit(repeatType) }
         if (getCurrentMedia()?.type == MediaWrapper.TYPE_VIDEO)
-            settings.putSingle(PLAYLIST_VIDEO_REPEAT_MODE_KEY, repeating.value)
+            settings.putSingle(PLAYLIST_VIDEO_REPEAT_MODE_KEY, repeatType)
         else
-            settings.putSingle(PLAYLIST_AUDIO_REPEAT_MODE_KEY, repeating.value)
+            settings.putSingle(PLAYLIST_AUDIO_REPEAT_MODE_KEY, repeatType)
         savePosition()
+        launch { determinePrevAndNextIndices() }
+    }
+
+    fun setLoopMode(mode: LoopMode) {
+        loopMode = mode
+        settings.putSingle(if (getCurrentMedia()?.type == MediaWrapper.TYPE_VIDEO) PLAYLIST_VIDEO_LOOP_MODE_KEY else PLAYLIST_AUDIO_LOOP_MODE_KEY, mode.ordinal)
+        if (mode != LoopMode.NONE && repeating.value != PlaybackStateCompat.REPEAT_MODE_NONE) setRepeatType(PlaybackStateCompat.REPEAT_MODE_NONE)
+        abRepeatOn.value = mode == LoopMode.AB
+        if (mode == LoopMode.AB) getCurrentMedia()?.let { media ->
+            val start = media.getMetaLong(MediaWrapper.META_AB_REPEAT_START)
+            val stop = media.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP)
+            abRepeat.value = if (stop > start) ABRepeat(start, stop) else ABRepeat()
+        }
+        if (mode == LoopMode.EMBEDDED_PLAYLIST || mode == LoopMode.EMBEDDED_SINGLE) {
+            getCurrentMedia()?.let { media ->
+                launch {
+                    if (media.type == MediaWrapper.TYPE_AUDIO && !player.hasRenderer && !player.hasSampleLoopFor(media.uri)) {
+                        val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, media.uri) }
+                        if (getCurrentMedia()?.uri == media.uri && loopMode == mode && sampleLoop != null) {
+                            val time = player.getCurrentTime()
+                            player.setSampleLoop(media.uri, sampleLoop)
+                            player.seekSampleLoop(time)
+                            player.activateSampleLoop()
+                        } else sampleLoop?.release()
+                    }
+                    val points = withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, media.uri, media.length) }
+                    if (getCurrentMedia()?.uri == media.uri && loopMode == mode) setEmbeddedPoints(points)
+                }
+            }
+        } else {
+            setEmbeddedPoints(null)
+            player.clearSampleLoop()
+        }
         launch { determinePrevAndNextIndices() }
     }
 
@@ -481,7 +533,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         showAudioPlayer.value = PlayerController.playbackState != PlaybackStateCompat.STATE_STOPPED && (item !== null || !player.isVideoPlaying())
     }
 
-    suspend fun playIndex(index: Int, flags: Int = 0, forceResume:Boolean = false, forceRestart:Boolean = false) {
+    suspend fun playIndex(index: Int, flags: Int = 0, forceResume:Boolean = false, forceRestart:Boolean = false, restoreAB: ABRepeat? = null, loopStart: Long? = null) {
         // The fonts are scanned when the first text renderer is created, which would otherwise
         // delay the playback by several seconds on the first run. See [FontCache]
         // Wait before reading any state, as the queue can change in the meantime
@@ -510,6 +562,10 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         if (mw.type == MediaWrapper.TYPE_VIDEO && !isAppStarted() && !isInCustomPiP) videoBackground = true
         val isVideoPlaying = mw.type == MediaWrapper.TYPE_VIDEO && player.isVideoPlaying()
         setRepeatTypeFromSettings()
+        clearABRepeat()
+        if (loopMode == LoopMode.AB && restoreAB != null) abRepeat.value = restoreAB
+        abRepeatOn.value = loopMode == LoopMode.AB
+        setEmbeddedPoints(null)
         if (!videoBackground && isVideoPlaying) mw.addFlags(MediaWrapper.MEDIA_VIDEO)
         if (videoBackground) mw.addFlags(MediaWrapper.MEDIA_FORCE_AUDIO)
         if (isBenchmark) mw.addFlags(MediaWrapper.MEDIA_BENCHMARK)
@@ -531,27 +587,36 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
             val title = mw.getMetaLong(MediaWrapper.META_TITLE)
             if (title > 0) uri = "$uri#$title".toUri()
 
+            if (loopStart != null) savedTime = 0L
             val start: Long
             if (isVideoPlaying) {
-                start = if (forceRestart
+                start = loopStart ?: if (forceRestart
                     || videoResumeStatus == ResumeStatus.NEVER) 0L else getStartTime(mw)
                 // If we explicitly restart or NEVER resume is set, ensure any leftover savedTime is cleared
                 if (start == 0L && (forceRestart || videoResumeStatus == ResumeStatus.NEVER)) savedTime = 0L
-                if (!forceResume && videoResumeStatus == ResumeStatus.ASK && start > 0 && isAppStarted()) {
+                if (loopStart == null && !forceResume && videoResumeStatus == ResumeStatus.ASK && start > 0 && isAppStarted()) {
                     waitForConfirmation.postValue(WaitConfirmation(mw.title, index, flags))
                     return
                 }
             } else {
-                start = if (forceRestart
+                start = loopStart ?: if (forceRestart
                     || audioResumeStatus == ResumeStatus.NEVER) 0L else getStartTime(mw)
                 // If we explicitly restart or NEVER resume is set, ensure any leftover savedTime is cleared
                 if (start == 0L && (forceRestart || audioResumeStatus == ResumeStatus.NEVER)) savedTime = 0L
-                if (!forceResume && audioResumeStatus == ResumeStatus.ASK && start > 0 && isAppStarted()) {
+                if (loopStart == null && !forceResume && audioResumeStatus == ResumeStatus.ASK && start > 0 && isAppStarted()) {
                     val confirmation = WaitConfirmation(mw.title, index, flags)
                     waitForConfirmationAudio.postValue(confirmation)
                     return
                 }
             }
+            if ((loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST) &&
+                mw.type == MediaWrapper.TYPE_AUDIO && !player.hasRenderer) {
+                if (!player.hasSampleLoopFor(mw.uri)) {
+                    val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, mw.uri) }
+                    player.setSampleLoop(mw.uri, sampleLoop)
+                    if (loopStart == null && start > 0) player.seekSampleLoop(start)
+                }
+            } else player.clearSampleLoop()
             //todo restore position as well when we move to VLC 4.0
             val media = mediaFactory.getFromUri(VLCInstance.getInstance(service), uri)
             //fixme workaround to prevent the issue described in https://code.videolan.org/videolan/vlc-android/-/issues/2106
@@ -567,7 +632,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 media.addOption(":dav1d-thread-frames=$dav1dThreadNumber")
             }
             //todo in VLC 4.0, this should be done by using libvlc_media_player_set_time instead of start-time
-            media.addOption(":start-time=${start/1000L}")
+            media.addOption(":start-time=${if (loopStart != null) start / 1000.0 else start / 1000L}")
             media.addOption(":no-sout-chromecast-video")
             VLCOptions.setMediaOptions(media, ctx, flags or mw.flags, PlaybackService.hasRenderer())
             /* keeping only video during benchmark */
@@ -757,6 +822,12 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     }
 
     private fun loadMediaMeta(media: MediaWrapper) {
+        val abStart = if (settings.getBoolean(PLAYBACK_HISTORY, true)) media.getMetaLong(MediaWrapper.META_AB_REPEAT_START) else 0L
+        if (loopMode == LoopMode.AB && (abStart > 0L || media.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP) > 0L)) {
+            val abStop = media.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP)
+            abRepeat.value = ABRepeat(abStart, if (abStop > abStart) abStop else -1L)
+            abRepeatOn.value = true
+        }
         if (player.canSwitchToVideo()) {
             val savedDelay = media.getMetaLong(MediaWrapper.META_AUDIODELAY)
             val globalDelay = Settings.getInstance(AppContextProvider.appContext).getLong(AUDIO_DELAY_GLOBAL, 0L)
@@ -764,12 +835,6 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 player.setAudioDelay(globalDelay)
             } else if (settings.getBoolean(KEY_SAVE_INDIVIDUAL_AUDIO_DELAY, true)) {
                 player.setAudioDelay(savedDelay)
-            }
-            val abStart = if (settings.getBoolean(PLAYBACK_HISTORY, true))  media.getMetaLong(MediaWrapper.META_AB_REPEAT_START) else 0L
-            if (abStart != 0L) {
-                abRepeatOn.value = true
-                val abStop = media.getMetaLong(MediaWrapper.META_AB_REPEAT_STOP)
-                abRepeat.postValue(ABRepeat(abStart, if (abStop == 0L) -1L else abStop))
             }
             player.setSpuTrack(media.getMetaLong(MediaWrapper.META_SUBTITLE_TRACK).toString())
             player.setSpuDelay(media.getMetaLong(MediaWrapper.META_SUBTITLE_DELAY))
@@ -910,7 +975,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 // If we've played all songs already in shuffle, then either
                 // reshuffle or stop (depending on RepeatType).
                 if (previous.size + 1 == size) {
-                    if (repeating.value == PlaybackStateCompat.REPEAT_MODE_NONE) {
+                    if (repeating.value == PlaybackStateCompat.REPEAT_MODE_NONE && loopMode != LoopMode.EMBEDDED_PLAYLIST) {
                         nextIndex = -1
                         return
                     } else {
@@ -926,7 +991,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 if (currentIndex > 0) prevIndex = currentIndex - 1
                 nextIndex = when {
                     currentIndex + 1 < size -> currentIndex + 1
-                    repeating.value == PlaybackStateCompat.REPEAT_MODE_NONE -> -1
+                    repeating.value == PlaybackStateCompat.REPEAT_MODE_NONE && loopMode != LoopMode.EMBEDDED_PLAYLIST -> -1
                     else -> 0
                 }
             }
@@ -1158,6 +1223,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
 
     fun toggleABRepeat() {
         abRepeatOn.value = !abRepeatOn.value!!
+        setLoopMode(if (abRepeatOn.value == true) LoopMode.AB else LoopMode.NONE)
         if (abRepeatOn.value == false) {
             abRepeat.value = ABRepeat()
         }
@@ -1173,6 +1239,28 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
             stop = -1L
         }
         abRepeatOn.value = false
+    }
+
+    private fun setEmbeddedPoints(points: ABRepeat?) {
+        embeddedLoopJob?.cancel()
+        embeddedPoints = points
+        if (points == null || player.hasSampleLoop()) return
+        val mediaUri = getCurrentMedia()?.uri ?: return
+        val index = currentIndex
+        embeddedLoopJob = launch {
+            while (currentIndex == index && getCurrentMedia()?.uri == mediaUri &&
+                (loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST)) {
+                val remaining = points.stop - player.mediaplayer.time
+                val length = player.getLength()
+                val seekLead = if (length > 0 && points.stop >= length - EMBEDDED_LOOP_SEEK_LEAD_MS)
+                    EMBEDDED_LOOP_SEEK_LEAD_MS else 0L
+                if (player.isPlaying() && remaining <= seekLead) {
+                    service.setTime(points.start, false)
+                    // The decoder may still report its old position while the seek completes.
+                    delay(200)
+                } else delay(if (player.isPlaying() && remaining < 1_000L) 20L else 250L)
+            }
+        }
     }
 
     override fun onEvent(event: IMedia.Event) {
@@ -1215,6 +1303,9 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                     if (newMedia) {
                         loadMediaMeta(mw)
                         mw.length = player.getLength()
+                        if (loopMode == LoopMode.EMBEDDED_PLAYLIST || loopMode == LoopMode.EMBEDDED_SINGLE) {
+                            setEmbeddedPoints(withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, mw.uri, mw.length) })
+                        }
                         saveMediaList()
                         savePosition()
                         saveCurrentMedia()
@@ -1231,6 +1322,13 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                     playingState.value = true
                 }
                 MediaPlayer.Event.EndReached -> {
+                    if (stopAfter != currentIndex && (loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.AB || (loopMode == LoopMode.EMBEDDED_PLAYLIST && embeddedPoints != null))) {
+                        val points = if (loopMode == LoopMode.AB) abRepeat.value?.let { ABRepeat(it.start, it.stop) } else null
+                        val embeddedStart = if (loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST) embeddedPoints?.start else null
+                        launch { playIndex(currentIndex, forceRestart = true, restoreAB = points, loopStart = embeddedStart) }
+                        if (!player.hasSampleLoop()) service.onMediaPlayerEvent(event)
+                        return
+                    }
                     clearABRepeat()
                     getCurrentMedia()?.addFlags(MediaWrapper.MEDIA_FROM_START)
                     if (currentIndex != nextIndex) {
@@ -1252,7 +1350,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                                 updateNextProgramAfterThumbnailGeneration(service, service.applicationContext, it)
                             }
                         }
-                        next()
+                        next(force = loopMode == LoopMode.EMBEDDED_PLAYLIST)
                     }
                 }
                 MediaPlayer.Event.EncounteredError -> {
@@ -1269,7 +1367,8 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                     if (currentIndex != nextIndex) next() else stop()
                 }
                 MediaPlayer.Event.TimeChanged -> {
-                    abRepeat.value?.let {
+                    val embedded = embeddedPoints
+                    if (embedded == null && (loopMode == LoopMode.AB || (loopMode == LoopMode.NONE && abRepeatOn.value == true))) abRepeat.value?.let {
                         val fastSeek = settings.getBoolean(KEY_ALWAYS_FAST_SEEK, false)
                         if (it.stop != -1L && player.getCurrentTime() > it.stop) service.setTime(it.start, false)
                         if ((fastSeek && player.getCurrentTime() < it.start - 30000L)
