@@ -176,6 +176,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
     var loopMode = LoopMode.NONE
         private set
     private var embeddedPoints: ABRepeat? = null
+    private var gameLoopPoints: ABRepeat? = null
     private var embeddedLoopJob: Job? = null
     val videoStatsOn by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<Boolean>().apply { value = false } }
     val delayValue by lazy(LazyThreadSafetyMode.NONE) { MutableLiveData<DelayValues>().apply { value = DelayValues() } }
@@ -508,8 +509,11 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         if (mode == LoopMode.EMBEDDED_PLAYLIST || mode == LoopMode.EMBEDDED_SINGLE) {
             getCurrentMedia()?.let { media ->
                 launch {
+                    val gameAudio = if (GameAudioConverter.supports(media.uri))
+                        withContext(Dispatchers.IO) { GameAudioConverter.decode(ctx, media.uri) } else null
+                    if (gameAudio != null) gameLoopPoints = gameAudio.loopPoints
                     if (media.type == MediaWrapper.TYPE_AUDIO && !player.hasRenderer && !player.hasSampleLoopFor(media.uri)) {
-                        val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, media.uri) }
+                        val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, gameAudio?.uri ?: media.uri) }
                         if (getCurrentMedia()?.uri == media.uri && loopMode == mode && sampleLoop != null) {
                             val time = player.getCurrentTime()
                             player.setSampleLoop(media.uri, sampleLoop)
@@ -517,7 +521,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                             player.activateSampleLoop()
                         } else sampleLoop?.release()
                     }
-                    val points = withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, media.uri, media.length) }
+                    val points = gameAudio?.loopPoints ?: withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, media.uri, media.length) }
                     if (getCurrentMedia()?.uri == media.uri && loopMode == mode) setEmbeddedPoints(points)
                 }
             }
@@ -580,6 +584,15 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 skipMedia()
                 return
             }
+            val gameAudio = if (GameAudioConverter.supports(mw.uri))
+                withContext(Dispatchers.IO) { GameAudioConverter.decode(ctx, mw.uri) } else null
+            gameLoopPoints = gameAudio?.loopPoints
+            if (gameAudio != null) {
+                // Repair titles saved by older builds that read the converted cache file's metadata.
+                if (mw.title?.matches(Regex("velc-game-[0-9a-f]+\\.wav")) == true)
+                    mw.title = mw.fileName.substringBeforeLast('.')
+                uri = gameAudio.uri
+            }
             //PiP TV
             if (!isBenchmark && AndroidDevices.isTv && isVideoPlaying) {
                 VideoPlayerActivity.startOpened(ctx, mw.uri, currentIndex)
@@ -612,7 +625,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
             if ((loopMode == LoopMode.EMBEDDED_SINGLE || loopMode == LoopMode.EMBEDDED_PLAYLIST) &&
                 mw.type == MediaWrapper.TYPE_AUDIO && !player.hasRenderer) {
                 if (!player.hasSampleLoopFor(mw.uri)) {
-                    val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, mw.uri) }
+                    val sampleLoop = withContext(Dispatchers.IO) { PcmWaveLoop.load(ctx, gameAudio?.uri ?: mw.uri) }
                     player.setSampleLoop(mw.uri, sampleLoop)
                     if (loopStart == null && start > 0) player.seekSampleLoop(start)
                 }
@@ -1268,12 +1281,15 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
         when (event.type) {
             IMedia.Event.MetaChanged -> {
                 /* Update Meta if file is already parsed */
-                if (parsed && player.updateCurrentMeta(event.metaId, getCurrentMedia())) service.onMediaListChanged()
+                val current = getCurrentMedia()
+                if (parsed && current?.uri?.let(GameAudioConverter::supports) != true &&
+                    player.updateCurrentMeta(event.metaId, current)) service.onMediaListChanged()
                 if (BuildConfig.DEBUG) Log.i(TAG, "Media.Event.MetaChanged: " + event.metaId)
             }
             IMedia.Event.ParsedChanged -> {
                 if (BuildConfig.DEBUG) Log.i(TAG, "Media.Event.ParsedChanged")
-                player.updateCurrentMeta(-1, getCurrentMedia())
+                val current = getCurrentMedia()
+                if (current?.uri?.let(GameAudioConverter::supports) != true) player.updateCurrentMeta(-1, current)
                 parsed = true
             }
             else -> update = false
@@ -1304,7 +1320,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                         loadMediaMeta(mw)
                         mw.length = player.getLength()
                         if (loopMode == LoopMode.EMBEDDED_PLAYLIST || loopMode == LoopMode.EMBEDDED_SINGLE) {
-                            setEmbeddedPoints(withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, mw.uri, mw.length) })
+                            setEmbeddedPoints(gameLoopPoints ?: withContext(Dispatchers.IO) { EmbeddedLoopPoints.read(ctx, mw.uri, mw.length) })
                         }
                         saveMediaList()
                         savePosition()
@@ -1408,6 +1424,7 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
      * @param mw: The [MediaWrapper] to be updated
      */
     private fun refreshTrackMeta(mw: MediaWrapper) {
+        if (GameAudioConverter.supports(mw.uri)) return
         mw.updateMeta(player.mediaplayer)
         service.onMediaListChanged()
         service.showNotification()

@@ -195,6 +195,8 @@
                 <data android:mimeType="application/x-iso9660-image"/>
                 <data android:mimeType="application/x-extension-mp4"/>
                 <data android:mimeType="application/x-flac"/>
+                <data android:mimeType="application/x-brstm"/>
+                <data android:mimeType="application/x-ast"/>
                 <data android:mimeType="application/x-matroska"/>
                 <data android:mimeType="application/x-mpegURL"/>
                 <data android:mimeType="application/x-ogg"/>
@@ -202,6 +204,16 @@
                 <data android:mimeType="application/x-shockwave-flash"/>
                 <data android:mimeType="application/xspf+xml"/>
                 <data android:mimeType="misc/ultravox"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="file"/>
+                <data android:scheme="content"/>
+                <data android:mimeType="application/octet-stream"/>
+                <data android:pathPattern=".*\\.brstm"/>
+                <data android:pathPattern=".*\\.ast"/>
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW"/>
@@ -587,6 +599,10 @@
                 <data android:pathPattern=".*\\..*\\.xesc" />
 
                 <!-- audio -->
+                <data android:pathPattern=".*\.brstm" />
+                <data android:pathPattern=".*\.BRSTM" />
+                <data android:pathPattern=".*\.ast" />
+                <data android:pathPattern=".*\.AST" />
 
                 <data android:pathPattern=".*\\..*\\.3ga" />
                 <data android:pathPattern=".*\\..*\\.3GA" />
