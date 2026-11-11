@@ -259,6 +259,23 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
 
     @MainThread
     suspend fun load(list: List<MediaWrapper>, position: Int, mlUpdate: Boolean = false, avoidErasingStop:Boolean = false) {
+        val (expandedList, expandedPosition) = withContext(Dispatchers.IO) {
+            val tracks = ArrayList<MediaWrapper>()
+            var selected = 0
+            list.forEachIndexed { index, media ->
+                if (index == position) selected = tracks.size
+                val count = GameAudioConverter.archiveTrackCount(ctx, media.uri) ?: 0
+                if (count > 1) {
+                    for (track in 1..count) {
+                        val uri = media.uri.buildUpon().fragment("velc-rwar=$track").build()
+                        tracks.add(MLServiceLocator.getAbstractMediaWrapper(uri).apply {
+                            title = "${media.fileName.substringBeforeLast('.')} #$track"
+                        })
+                    }
+                } else tracks.add(media)
+            }
+            tracks to selected
+        }
         saveMediaList()
         savePosition()
         mediaList.removeEventListener(this@PlaylistManager)
@@ -274,19 +291,19 @@ class PlaylistManager(val service: PlaybackService) : MediaWrapperList.EventList
                 }
             }
         }
-        mediaList.replaceWith(list)
+        mediaList.replaceWith(expandedList)
         if (!hasMedia()) {
             Log.w(TAG, "Warning: empty media list, nothing to play !")
             return
         }
-        currentIndex = if (isValidPosition(position)) position else 0
+        currentIndex = if (isValidPosition(expandedPosition)) expandedPosition else 0
 
         // Add handler after loading the list
         mediaList.addEventListener(this@PlaylistManager)
         val instance = Settings.getInstance(AppContextProvider.appContext)
         if (!avoidErasingStop) instance.putSingle(AUDIO_STOP_AFTER, -1)
         stopAfter = instance.getInt(AUDIO_STOP_AFTER, -1)
-        if (stopAfter < position) stopAfter = -1
+        if (stopAfter < expandedPosition) stopAfter = -1
         clearABRepeat()
         player.setRate(1.0f, false)
         playIndex(currentIndex)

@@ -197,6 +197,14 @@
                 <data android:mimeType="application/x-flac"/>
                 <data android:mimeType="application/x-brstm"/>
                 <data android:mimeType="application/x-ast"/>
+                <data android:mimeType="application/x-brwav"/>
+                <data android:mimeType="application/x-rwav"/>
+                <data android:mimeType="application/x-rwar"/>
+                <data android:mimeType="application/x-bfstm"/>
+                <data android:mimeType="application/x-bfwav"/>
+                <data android:mimeType="application/x-fwav"/>
+                <data android:mimeType="application/x-bcstm"/>
+                <data android:mimeType="application/x-bcwav"/>
                 <data android:mimeType="application/x-matroska"/>
                 <data android:mimeType="application/x-mpegURL"/>
                 <data android:mimeType="application/x-ogg"/>
@@ -214,6 +222,14 @@
                 <data android:mimeType="application/octet-stream"/>
                 <data android:pathPattern=".*\\.brstm"/>
                 <data android:pathPattern=".*\\.ast"/>
+                <data android:pathPattern=".*\\.brwav"/>
+                <data android:pathPattern=".*\\.rwav"/>
+                <data android:pathPattern=".*\\.rwar"/>
+                <data android:pathPattern=".*\\.bfstm"/>
+                <data android:pathPattern=".*\\.bfwav"/>
+                <data android:pathPattern=".*\\.fwav"/>
+                <data android:pathPattern=".*\\.bcstm"/>
+                <data android:pathPattern=".*\\.bcwav"/>
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW"/>
@@ -603,6 +619,22 @@
                 <data android:pathPattern=".*\.BRSTM" />
                 <data android:pathPattern=".*\.ast" />
                 <data android:pathPattern=".*\.AST" />
+                <data android:pathPattern=".*\.brwav" />
+                <data android:pathPattern=".*\.BRWAV" />
+                <data android:pathPattern=".*\.rwav" />
+                <data android:pathPattern=".*\.RWAV" />
+                <data android:pathPattern=".*\.rwar" />
+                <data android:pathPattern=".*\.RWAR" />
+                <data android:pathPattern=".*\.bfstm" />
+                <data android:pathPattern=".*\.BFSTM" />
+                <data android:pathPattern=".*\.bfwav" />
+                <data android:pathPattern=".*\.BFWAV" />
+                <data android:pathPattern=".*\.fwav" />
+                <data android:pathPattern=".*\.FWAV" />
+                <data android:pathPattern=".*\.bcstm" />
+                <data android:pathPattern=".*\.BCSTM" />
+                <data android:pathPattern=".*\.bcwav" />
+                <data android:pathPattern=".*\.BCWAV" />
 
                 <data android:pathPattern=".*\\..*\\.3ga" />
                 <data android:pathPattern=".*\\..*\\.3GA" />

@@ -320,7 +320,10 @@ public abstract class MediaWrapper extends MediaLibraryItem implements Parcelabl
         if (!TextUtils.isEmpty(fileExt)) {
             if (Extensions.VIDEO.contains(fileExt)) {
                 mType = TYPE_VIDEO;
-            } else if (Extensions.AUDIO.contains(fileExt) || ".brstm".equals(fileExt) || ".ast".equals(fileExt)) {
+            } else if (Extensions.AUDIO.contains(fileExt) || ".brstm".equals(fileExt) || ".ast".equals(fileExt)
+                    || ".brwav".equals(fileExt) || ".rwav".equals(fileExt) || ".rwar".equals(fileExt)
+                    || ".bfstm".equals(fileExt) || ".bfwav".equals(fileExt) || ".fwav".equals(fileExt)
+                    || ".bcstm".equals(fileExt) || ".bcwav".equals(fileExt)) {
                 mType = TYPE_AUDIO;
             } else if (Extensions.SUBTITLES.contains(fileExt)) {
                 mType = TYPE_SUBTITLE;

@@ -10,16 +10,31 @@ import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
 
-/** Decodes Nintendo BRSTM/AST to PCM WAVE for the existing VLC player pipeline. */
+/** Decodes NintendoWare streams, waves, and RWAR entries to PCM WAVE. */
 internal object GameAudioConverter {
     private const val TAG = "VELC/GameAudio"
     private const val MAX_WAVE_BYTES = 1024L * 1024 * 1024
+    private val EXTENSIONS = setOf("brstm", "ast", "brwav", "rwav", "rwar", "bfstm", "bfwav", "fwav", "bcstm", "bcwav")
+    private const val RWAR_FRAGMENT = "velc-rwar="
 
     data class Decoded(val uri: Uri, val loopPoints: ABRepeat?)
 
     fun supports(uri: Uri): Boolean {
-        val name = uri.lastPathSegment?.lowercase() ?: return false
-        return name.endsWith(".brstm") || name.endsWith(".ast")
+        return uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase() in EXTENSIONS
+    }
+
+    /** Returns the number of playable RWAVs; null means this is not a valid RWAR. */
+    fun archiveTrackCount(context: Context, uri: Uri): Int? {
+        if (!uri.lastPathSegment.orEmpty().endsWith(".rwar", true) || uri.fragment?.startsWith(RWAR_FRAGMENT) == true) return null
+        val input = File.createTempFile("velc-rwar-", ".rwar", context.cacheDir)
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { source -> input.outputStream().use(source::copyTo) }
+                ?: return null
+            RandomAccessFile(input, "r").use { rwarEntries(it).size }
+        } catch (error: Exception) {
+            Log.w(TAG, "Cannot read RWAR $uri", error)
+            null
+        } finally { input.delete() }
     }
 
     fun decode(context: Context, uri: Uri): Decoded? {
@@ -27,22 +42,45 @@ internal object GameAudioConverter {
         val source = File(uri.path.orEmpty())
         val stamp = if (uri.scheme == "file") "${source.length()}:${source.lastModified()}" else ""
         val digest = MessageDigest.getInstance("SHA-256")
-            .digest("v2:$uri:$stamp".toByteArray())
+            .digest("v3:$uri:$stamp".toByteArray())
             .take(12).joinToString("") { "%02x".format(it) }
         val output = File(context.cacheDir, "velc-game-$digest.wav")
         if (output.length() > 44L) return Decoded(Uri.fromFile(output), readLoop(output))
 
-        val extension = if (uri.lastPathSegment?.endsWith(".ast", true) == true) ".ast" else ".brstm"
+        val extension = ".${uri.lastPathSegment?.substringAfterLast('.', "brstm")?.lowercase()}"
         val input = File.createTempFile("velc-game-input-", extension, context.cacheDir)
         val pending = File.createTempFile("velc-game-output-", ".wav", context.cacheDir)
+        var entryFile: File? = null
         try {
             context.contentResolver.openInputStream(uri)?.use { stream ->
                 input.outputStream().use { stream.copyTo(it) }
             } ?: return null
+            val decodeInput = if (extension == ".rwar") {
+                val entry = uri.fragment?.removePrefix(RWAR_FRAGMENT)?.toIntOrNull() ?: 1
+                val subfile = File.createTempFile("velc-rwar-entry-", ".rwav", context.cacheDir)
+                entryFile = subfile
+                RandomAccessFile(input, "r").use { archive ->
+                    val entries = rwarEntries(archive)
+                    require(entry in 1..entries.size)
+                    val (offset, length) = entries[entry - 1]
+                    archive.seek(offset)
+                    subfile.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var remaining = length
+                        while (remaining > 0) {
+                            val read = archive.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+                            require(read > 0) { "Truncated RWAR entry" }
+                            output.write(buffer, 0, read)
+                            remaining -= read
+                        }
+                    }
+                }
+                subfile
+            } else input
             val native = VgmNative()
-            val metadataHandle = native.open(input.absolutePath, 1.0, 0L, 0, 0L, false, 2, 0)
+            val metadataHandle = native.open(decodeInput.absolutePath, 1.0, 0L, 0, 0L, false, 2, 0)
             val loop = try { native.getLoopInfo(metadataHandle) } finally { native.close(metadataHandle) }
-            val handle = native.open(input.absolutePath, 1.0, 0L, 2, 0L, false, 2, 0)
+            val handle = native.open(decodeInput.absolutePath, 1.0, 0L, 2, 0L, false, 2, 0)
             try {
                 val rate = native.getSampleRate(handle)
                 val channels = native.getChannels(handle)
@@ -85,7 +123,33 @@ internal object GameAudioConverter {
             return null
         } finally {
             input.delete()
+            entryFile?.delete()
             pending.delete()
+        }
+    }
+
+    private fun rwarEntries(file: RandomAccessFile): List<Pair<Long, Long>> {
+        require(file.length() >= 0x20)
+        file.seek(0)
+        require(file.readInt() == 0x52574152) { "Missing RWAR header" }
+        file.seek(0x10)
+        val tableOffset = file.readInt().toLong() and 0xffffffffL
+        file.seek(0x18)
+        val dataOffset = file.readInt().toLong() and 0xffffffffL
+        require(tableOffset + 12 <= file.length() && dataOffset + 8 <= file.length())
+        file.seek(tableOffset)
+        require(file.readInt() == 0x5441424c) { "Missing TABL section" }
+        file.seek(dataOffset)
+        require(file.readInt() == 0x44415441) { "Missing DATA section" }
+        file.seek(tableOffset + 8)
+        val count = file.readInt()
+        require(count in 1..4096 && tableOffset + 12L + count * 12L <= file.length())
+        return (0 until count).map { index ->
+            file.seek(tableOffset + 12L + index * 12L + 4L)
+            val offset = dataOffset + (file.readInt().toLong() and 0xffffffffL)
+            val size = file.readInt().toLong() and 0xffffffffL
+            require(size > 0 && offset >= dataOffset + 8 && offset <= file.length() - size)
+            offset to size
         }
     }
 
